@@ -1,91 +1,180 @@
 """
-detect_and_sort.py — Real-time sortasi biji kopi sangrai.
-Pipeline per frame:
-  1. Capture frame dari Picamera2.
-  2. Deteksi kontur biji (find_bean_contours dengan ROI + filter shape).
-  3. Untuk setiap kontur, ekstraksi fitur dan klasifikasi (Random Forest).
-  4. Deduplikasi via centroid tracker (cegah satu biji dihitung berkali-kali).
-  5. Kalau prediksi = 'reject', jadwalkan trigger solenoid setelah delay fisik.
-  6. Tampilkan counter accepted/reject dan bounding box.
+detect_and_sort.py — Real-time sortasi biji kopi sangrai (v2).
+
+PERUBAHAN UTAMA v2:
+  1. Bisa ganti mode deteksi on-the-fly tanpa restart:
+       Tekan 'M' → siklus: auto → grayscale → hsv → lab → adaptive → auto
+  2. Anti-inversi: mask tidak lagi terbalik saat background terang.
+  3. Tampilan debug mask ada di pojok kanan bawah frame (tidak perlu window terpisah).
+  4. Confidence threshold: prediksi rendah tidak langsung ditrigger solenoid.
+  5. HUD lebih informatif: mode deteksi aktif, confidence, total frame.
+  6. Kontrol keyboard:
+       'q' = keluar
+       'm' = ganti mode deteksi
+       'd' = toggle debug mask overlay
+       'r' = reset counter
+       's' = simpan screenshot
 """
+
 import os
 import pickle
 import threading
 import time
+
 import cv2
 import numpy as np
-from picamera2 import Picamera2
-import RPi.GPIO as GPIO
-from preprocess import find_bean_contours, extract_features
 
-# --- Konfigurasi GPIO solenoid ---
-SOLENOID_PIN = 18
-SOLENOID_ON = GPIO.LOW
-SOLENOID_OFF = GPIO.HIGH
+# Coba import GPIO (hanya ada di Raspberry Pi)
+try:
+    import RPi.GPIO as GPIO
+    _GPIO_AVAILABLE = True
+except ImportError:
+    _GPIO_AVAILABLE = False
+    print("[WARN] RPi.GPIO tidak tersedia — solenoid dinonaktifkan (mode simulasi).")
 
-# --- Timing solenoid (KALIBRASI WAJIB) ---
-SOLENOID_DELAY_S = 0.05
-SOLENOID_PULSE_S = 0.05
-SOLENOID_MIN_GAP_S = 0.08
+# Coba import Picamera2 (hanya ada di Raspberry Pi)
+try:
+    from picamera2 import Picamera2
+    _PICAM_AVAILABLE = True
+except ImportError:
+    _PICAM_AVAILABLE = False
+    print("[WARN] Picamera2 tidak tersedia — menggunakan webcam USB (cv2.VideoCapture).")
 
-# --- Konfigurasi tracker dedup ---
-DEDUP_DISTANCE_PX = 80
-DEDUP_TIME_S = 1.0
+from preprocess import find_bean_contours, extract_features, CONFIG as PREP_CONFIG
 
-# --- Konfigurasi kamera ---
-FRAME_SIZE = (640, 480)
-WINDOW_NAME = "Sortasi Real-Time"
+# ─────────────────────────────────────────────────────────────
+# KONFIGURASI
+# ─────────────────────────────────────────────────────────────
 
-# ROI rectangle (x, y, w, h). 
-# TODO: UBAH ANGKA INI! Geser dan ubah ukuran kotak agar pas di jalur jatuh biji kopi.
-# Nilai perkiraan sementara berdasarkan gambar Anda:
-ROI_RECT = (350, 100, 150, 300) 
-SHOW_DEBUG_MASK = True # Biarkan True dulu untuk kalibrasi
+# GPIO solenoid
+SOLENOID_PIN     = 18
+SOLENOID_ON      = 0   # active LOW
+SOLENOID_OFF     = 1
+SOLENOID_DELAY_S = 0.05    # TODO: ukur jarak kamera→solenoid (detik)
+SOLENOID_PULSE_S = 0.05    # TODO: tune
+SOLENOID_MIN_GAP = 0.08    # minimum gap antar pulse
+
+# Centroid dedup
+DEDUP_DIST_PX  = 80
+DEDUP_TIME_S   = 1.2
+
+# Confidence threshold — prediksi di bawah ini diabaikan / ditampilkan beda warna
+CONFIDENCE_THRESHOLD = 0.60
+
+# Kamera
+FRAME_SIZE   = (640, 480)
+CAMERA_INDEX = 0           # untuk webcam USB
+
+# ROI — set setelah hardware final. Format: (x, y, w, h) atau None
+ROI_RECT = None            # TODO: contoh (100, 50, 440, 380)
+
+# Model
 MODEL_FILE = "defect_model.pkl"
 
+# Mode deteksi yang bisa disiklus dengan tombol 'M'
+DETECTION_MODES = ["auto", "grayscale", "hsv", "lab", "adaptive"]
+
+
+# ─────────────────────────────────────────────────────────────
+# CENTROID TRACKER
+# ─────────────────────────────────────────────────────────────
+
 class CentroidTracker:
-    def __init__(self, max_distance=DEDUP_DISTANCE_PX, ttl=DEDUP_TIME_S):
-        self.entries = []
-        self.max_distance = max_distance
-        self.ttl = ttl
+    def __init__(self, max_dist=DEDUP_DIST_PX, ttl=DEDUP_TIME_S):
+        self.entries  = []
+        self.max_dist = max_dist
+        self.ttl      = ttl
+
     def is_new(self, cx, cy):
         now = time.time()
         self.entries = [(x, y, t) for (x, y, t) in self.entries if now - t < self.ttl]
         for (x, y, _) in self.entries:
-            if (cx - x) ** 2 + (cy - y) ** 2 < self.max_distance ** 2:
+            if (cx - x) ** 2 + (cy - y) ** 2 < self.max_dist ** 2:
                 return False
         self.entries.append((cx, cy, now))
         return True
 
+
+# ─────────────────────────────────────────────────────────────
+# SOLENOID CONTROLLER
+# ─────────────────────────────────────────────────────────────
+
 class SolenoidController:
-    def __init__(self, pin, delay_s, pulse_s, min_gap_s):
-        self.pin = pin
-        self.delay_s = delay_s
-        self.pulse_s = pulse_s
-        self.min_gap_s = min_gap_s
-        self._lock = threading.Lock()
+    def __init__(self):
+        self._lock          = threading.Lock()
         self._last_fire_end = 0.0
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-        GPIO.setup(self.pin, GPIO.OUT)
-        GPIO.output(self.pin, SOLENOID_OFF)
+        self._active        = _GPIO_AVAILABLE
+
+        if self._active:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+            GPIO.setup(SOLENOID_PIN, GPIO.OUT)
+            GPIO.output(SOLENOID_PIN, SOLENOID_OFF)
+
     def schedule_fire(self):
-        timer = threading.Timer(self.delay_s, self._fire)
-        timer.daemon = True
-        timer.start()
+        t = threading.Timer(SOLENOID_DELAY_S, self._fire)
+        t.daemon = True
+        t.start()
+
     def _fire(self):
+        if not self._active:
+            print(f"  [SIM] Solenoid FIRE (simulasi, GPIO tidak tersedia)")
+            return
         with self._lock:
-            now = time.time()
-            wait = self._last_fire_end + self.min_gap_s - now
+            wait = self._last_fire_end + SOLENOID_MIN_GAP - time.time()
             if wait > 0:
                 time.sleep(wait)
-            GPIO.output(self.pin, SOLENOID_ON)
-            time.sleep(self.pulse_s)
-            GPIO.output(self.pin, SOLENOID_OFF)
+            GPIO.output(SOLENOID_PIN, SOLENOID_ON)
+            time.sleep(SOLENOID_PULSE_S)
+            GPIO.output(SOLENOID_PIN, SOLENOID_OFF)
             self._last_fire_end = time.time()
+
     def cleanup(self):
-        GPIO.output(self.pin, SOLENOID_OFF)
-        GPIO.cleanup()
+        if self._active:
+            GPIO.output(SOLENOID_PIN, SOLENOID_OFF)
+            GPIO.cleanup()
+
+
+# ─────────────────────────────────────────────────────────────
+# KAMERA ABSTRAKSI (Picamera2 atau Webcam)
+# ─────────────────────────────────────────────────────────────
+
+class Camera:
+    def __init__(self):
+        if _PICAM_AVAILABLE:
+            self._picam = Picamera2()
+            cfg = self._picam.create_preview_configuration(
+                main={"size": FRAME_SIZE, "format": "RGB888"}
+            )
+            self._picam.configure(cfg)
+            self._picam.start()
+            time.sleep(1.0)
+            self._mode = "picam"
+        else:
+            self._cap  = cv2.VideoCapture(CAMERA_INDEX)
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_SIZE[0])
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_SIZE[1])
+            self._mode = "cv2"
+
+    def read(self):
+        """Return frame BGR atau None jika gagal."""
+        if self._mode == "picam":
+            rgb = self._picam.capture_array()
+            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        else:
+            ret, frame = self._cap.read()
+            return frame if ret else None
+
+    def release(self):
+        if self._mode == "picam":
+            self._picam.stop()
+        else:
+            self._cap.release()
+
+
+# ─────────────────────────────────────────────────────────────
+# HELPER
+# ─────────────────────────────────────────────────────────────
 
 def build_roi_mask(frame_hw, rect):
     if rect is None:
@@ -96,88 +185,172 @@ def build_roi_mask(frame_hw, rect):
     m[y:y + rh, x:x + rw] = 255
     return m
 
+
+def overlay_mask(frame, mask, alpha=0.35, color=(0, 200, 255)):
+    """Overlay mask tipis di atas frame (visualisasi debug)."""
+    colored = np.zeros_like(frame)
+    colored[mask > 0] = color
+    cv2.addWeighted(colored, alpha, frame, 1 - alpha, 0, frame)
+
+
+def draw_hud(frame, counter, fps, mode, det_mode, show_debug):
+    h, w = frame.shape[:2]
+    bar = np.zeros((48, w, 3), dtype=np.uint8)
+    info = (f"Accept:{counter['accepted']}  Reject:{counter['reject']}  "
+            f"FPS:{fps:.1f}  Det:{det_mode}  "
+            f"Mask:{'ON' if show_debug else 'off'}")
+    cv2.putText(bar, info, (8, 32),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 255), 2)
+    frame[:48, :] = bar
+
+    # Panduan keyboard
+    legend = "M=mode  D=mask  R=reset  S=screenshot  Q=quit"
+    cv2.putText(frame, legend, (8, h - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 180), 1)
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN LOOP
+# ─────────────────────────────────────────────────────────────
+
 def main():
     if not os.path.exists(MODEL_FILE):
         print(f"[ERROR] {MODEL_FILE} tidak ditemukan. Jalankan train.py dulu.")
         return
+
     with open(MODEL_FILE, "rb") as f:
         bundle = pickle.load(f)
-    model = bundle["model"]
-    class_names = bundle["class_names"]
+    model        = bundle["model"]
+    class_names  = bundle["class_names"]
     reject_label = class_names.index("reject")
     print(f"[INFO] Model dimuat. Kelas: {class_names}")
-    
-    picam2 = Picamera2()
-    config = picam2.create_preview_configuration(main={"size": FRAME_SIZE, "format": "RGB888"})
-    picam2.configure(config)
-    picam2.start()
-    time.sleep(1.0)
-    
+
+    cam      = Camera()
+    solenoid = SolenoidController()
+    tracker  = CentroidTracker()
     roi_mask = build_roi_mask((FRAME_SIZE[1], FRAME_SIZE[0]), ROI_RECT)
-    solenoid = SolenoidController(pin=SOLENOID_PIN, delay_s=SOLENOID_DELAY_S, pulse_s=SOLENOID_PULSE_S, min_gap_s=SOLENOID_MIN_GAP_S)
-    tracker = CentroidTracker()
-    counter = {"accepted": 0, "reject": 0}
+
+    counter     = {"accepted": 0, "reject": 0}
+    mode_idx    = 0   # indeks di DETECTION_MODES
+    show_debug  = True
     frame_count = 0
-    t_start = time.time()
-    print("[INFO] Mulai. Tekan 'q' untuk keluar.")
-    
+    screenshot  = 0
+    t_start     = time.time()
+    fps_buf     = []
+
+    WINDOW = "Sortasi Real-Time v2"
+    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+
+    print("[INFO] Mulai. Kontrol: M=ganti mode  D=toggle mask  R=reset  S=screenshot  Q=quit")
+
     try:
         while True:
-            frame_rgb = picam2.capture_array()
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            
-            # Terapkan mask sebelum deteksi kontur
-            if roi_mask is not None:
-                frame_processed = cv2.bitwise_and(frame_bgr, frame_bgr, mask=roi_mask)
-            else:
-                frame_processed = frame_bgr
-                
-            contours, mask = find_bean_contours(frame_processed)
-            preview = frame_bgr.copy()
-            
+            t0 = time.time()
+            frame = cam.read()
+            if frame is None:
+                print("[ERROR] Gagal baca frame.")
+                break
+
+            det_mode = DETECTION_MODES[mode_idx]
+            PREP_CONFIG["detection_mode"] = det_mode
+
+            contours, mask, _ = find_bean_contours(frame, roi_mask=roi_mask)
+            preview = frame.copy()
+
+            # Overlay mask debug
+            if show_debug:
+                overlay_mask(preview, mask)
+
+            # ── Proses setiap kontur ───────────────────────────────
             for c in contours:
-                M = cv2.moments(c)
-                if M["m00"] == 0:
+                M_cnt = cv2.moments(c)
+                if M_cnt["m00"] == 0:
                     continue
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
+                cx = int(M_cnt["m10"] / M_cnt["m00"])
+                cy = int(M_cnt["m01"] / M_cnt["m00"])
                 x, y, w, h = cv2.boundingRect(c)
+
+                # Kontur sudah diproses sebelumnya → abu-abu
                 if not tracker.is_new(cx, cy):
-                    cv2.rectangle(preview, (x, y), (x + w, y + h), (128, 128, 128), 1)
+                    cv2.rectangle(preview, (x, y), (x+w, y+h), (100, 100, 100), 1)
                     continue
-                
-                feat = extract_features(frame_bgr, c).reshape(1, -1)
-                pred = int(model.predict(feat)[0])
-                label = class_names[pred]
-                counter[label] += 1
-                color = (0, 0, 255) if pred == reject_label else (0, 255, 0)
-                cv2.rectangle(preview, (x, y), (x + w, y + h), color, 2)
-                cv2.putText(preview, label, (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                
-                if pred == reject_label:
-                    solenoid.schedule_fire()
-                    print(f"[REJECT] cx={cx} cy={cy} → solenoid scheduled (+{SOLENOID_DELAY_S*1000:.0f}ms)")
-            
+
+                feat = extract_features(frame, c)
+                if feat is None:
+                    continue
+
+                feat_2d  = feat.reshape(1, -1)
+                pred     = int(model.predict(feat_2d)[0])
+                prob     = float(model.predict_proba(feat_2d)[0].max())
+                label    = class_names[pred]
+                low_conf = prob < CONFIDENCE_THRESHOLD
+
+                if low_conf:
+                    color      = (0, 165, 255)   # oranye = tidak yakin
+                    box_thick  = 1
+                elif pred == reject_label:
+                    color     = (0, 0, 255)       # merah = reject
+                    box_thick = 2
+                else:
+                    color     = (0, 255, 0)       # hijau = accept
+                    box_thick = 2
+
+                cv2.rectangle(preview, (x, y), (x+w, y+h), color, box_thick)
+                cv2.drawContours(preview, [c], -1, color, 1)
+                tag = f"{label} {prob:.0%}"
+                cv2.putText(preview, tag, (x, max(y-6, 12)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+                if not low_conf:
+                    counter[label] += 1
+                    if pred == reject_label:
+                        solenoid.schedule_fire()
+                        print(f"[REJECT] cx={cx} cy={cy} conf={prob:.0%} "
+                              f"→ solenoid +{SOLENOID_DELAY_S*1000:.0f}ms")
+
+            # ── ROI border ────────────────────────────────────────
             if ROI_RECT is not None:
                 rx, ry, rw, rh = ROI_RECT
-                cv2.rectangle(preview, (rx, ry), (rx + rw, ry + rh), (255, 0, 0), 1)
-            
+                cv2.rectangle(preview, (rx, ry), (rx+rw, ry+rh), (255, 200, 0), 1)
+
+            # ── FPS hitung ────────────────────────────────────────
             frame_count += 1
-            elapsed = time.time() - t_start
-            fps = frame_count / elapsed if elapsed > 0 else 0.0
-            hud = f"Accepted: {counter['accepted']}  Reject: {counter['reject']}  FPS: {fps:.1f}"
-            cv2.putText(preview, hud, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            cv2.imshow(WINDOW_NAME, preview)
-            
-            if SHOW_DEBUG_MASK:
-                cv2.imshow("Mask (debug)", mask)
-            if (cv2.waitKey(1) & 0xFF) == ord("q"):
+            dt = time.time() - t0
+            fps_buf.append(1.0 / max(dt, 1e-5))
+            if len(fps_buf) > 20:
+                fps_buf.pop(0)
+            fps = float(np.mean(fps_buf))
+
+            draw_hud(preview, counter, fps, mode_idx, det_mode, show_debug)
+            cv2.imshow(WINDOW, preview)
+
+            # ── Keyboard ──────────────────────────────────────────
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 break
+            elif key == ord('m'):
+                mode_idx = (mode_idx + 1) % len(DETECTION_MODES)
+                print(f"[MODE] Deteksi → {DETECTION_MODES[mode_idx]}")
+            elif key == ord('d'):
+                show_debug = not show_debug
+                print(f"[DEBUG] Mask overlay {'ON' if show_debug else 'OFF'}")
+            elif key == ord('r'):
+                counter = {"accepted": 0, "reject": 0}
+                print("[RESET] Counter direset.")
+            elif key == ord('s'):
+                fname = f"screenshot_{screenshot:04d}.jpg"
+                cv2.imwrite(fname, preview)
+                screenshot += 1
+                print(f"[SCREENSHOT] Disimpan: {fname}")
+
     finally:
-        picam2.stop()
+        cam.release()
         cv2.destroyAllWindows()
         solenoid.cleanup()
-        print(f"\n[DONE] Accepted={counter['accepted']}, Reject={counter['reject']}, Frame={frame_count}, Avg FPS={frame_count/max(elapsed, 1e-6):.2f}")
+        elapsed = max(time.time() - t_start, 1e-6)
+        print(f"\n[DONE] Accept={counter['accepted']}  Reject={counter['reject']}  "
+              f"Frame={frame_count}  Avg FPS={frame_count/elapsed:.2f}")
+
 
 if __name__ == "__main__":
     main()
