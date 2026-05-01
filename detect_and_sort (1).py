@@ -193,11 +193,12 @@ def overlay_mask(frame, mask, alpha=0.35, color=(0, 200, 255)):
     cv2.addWeighted(colored, alpha, frame, 1 - alpha, 0, frame)
 
 
-def draw_hud(frame, counter, fps, mode, det_mode, show_debug):
+def draw_hud(frame, counter, fps, mode, det_mode, show_debug, threshold=0.5):
     h, w = frame.shape[:2]
     bar = np.zeros((48, w, 3), dtype=np.uint8)
     info = (f"Accept:{counter['accepted']}  Reject:{counter['reject']}  "
             f"FPS:{fps:.1f}  Det:{det_mode}  "
+            f"Thr:{threshold:.2f}  "
             f"Mask:{'ON' if show_debug else 'off'}")
     cv2.putText(bar, info, (8, 32),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 255), 2)
@@ -220,10 +221,23 @@ def main():
 
     with open(MODEL_FILE, "rb") as f:
         bundle = pickle.load(f)
-    model        = bundle["model"]
-    class_names  = bundle["class_names"]
+
+    # Kompatibel dengan format lama (pickle langsung) maupun baru (dict bundle)
+    if isinstance(bundle, dict):
+        model         = bundle["model"]
+        class_names   = bundle["class_names"]
+        # Threshold optimal dari train.py — jika tidak ada, pakai default 0.5
+        # Nilai ini hasil tuning F1 saat training, menggantikan fixed 0.5
+        opt_threshold = bundle.get("threshold", CONFIDENCE_THRESHOLD)
+    else:
+        # Format lama: bundle IS model langsung (pickle.dump(model, f))
+        model         = bundle
+        class_names   = ["accepted", "reject"]
+        opt_threshold = CONFIDENCE_THRESHOLD
+
     reject_label = class_names.index("reject")
     print(f"[INFO] Model dimuat. Kelas: {class_names}")
+    print(f"[INFO] Threshold reject : {opt_threshold:.2f}  (hasil tuning train.py)")
 
     cam      = Camera()
     solenoid = SolenoidController()
@@ -279,11 +293,21 @@ def main():
                 if feat is None:
                     continue
 
-                feat_2d  = feat.reshape(1, -1)
-                pred     = int(model.predict(feat_2d)[0])
-                prob     = float(model.predict_proba(feat_2d)[0].max())
-                label    = class_names[pred]
-                low_conf = prob < CONFIDENCE_THRESHOLD
+                feat_2d   = feat.reshape(1, -1)
+                proba_all = model.predict_proba(feat_2d)[0]   # [P(accepted), P(reject)]
+                p_reject  = float(proba_all[reject_label])    # probabilitas kelas reject
+
+                # Gunakan threshold optimal dari train.py, bukan fixed 0.5.
+                # Jika P(reject) >= opt_threshold → prediksi REJECT.
+                # Ini kunci anti-bias: threshold disesuaikan saat training
+                # untuk menyeimbangkan precision dan recall antar kelas.
+                pred  = reject_label if p_reject >= opt_threshold else (1 - reject_label)
+                prob  = p_reject if pred == reject_label else (1.0 - p_reject)
+                label = class_names[pred]
+
+                # Oranye = zona abu-abu (probabilitas dekat threshold ±0.10)
+                near_threshold = abs(p_reject - opt_threshold) < 0.10
+                low_conf       = near_threshold
 
                 if low_conf:
                     color      = (0, 165, 255)   # oranye = tidak yakin
