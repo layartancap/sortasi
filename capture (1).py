@@ -2,14 +2,22 @@
 capture.py — Smart capture untuk pengumpulan dataset biji kopi sangrai.
 
 Mode kerja:
-  - Pilih kelas target di awal (accepted / reject).
-  - Auto-detect kemunculan biji via contour detection.
-  - Frame penuh disimpan ke folder dataset sesuai kelas (rising-edge trigger).
+  - Pengguna memilih kelas target di awal (accepted / reject).
+  - Sistem otomatis mendeteksi kemunculan biji via contour detection.
+  - Frame penuh disimpan ke folder dataset sesuai kelas saat biji terdeteksi
+    (rising-edge: frame sebelumnya kosong, frame sekarang ada biji).
   - Cooldown waktu mencegah duplikasi penyimpanan untuk biji yang sama.
 
+Trade-off:
+  - Rising-edge sederhana: kalau dua biji masuk frame nyaris bersamaan,
+    keduanya dianggap satu event (frame disimpan sekali). Untuk gravity-fed
+    dengan jarak antar-biji wajar, asumsi ini cukup memadai.
+  - Frame penuh disimpan (bukan crop) → fleksibel untuk re-preprocess di masa
+    depan, tapi memakan storage lebih besar.
+
 Kontrol keyboard saat preview:
-  - 'q'    : keluar.
-  - SPASI  : capture manual (override auto-detect).
+  - 'q'      : keluar.
+  - SPASI    : capture manual (override auto-detect).
 """
 
 import os
@@ -18,24 +26,19 @@ import time
 from datetime import datetime
 
 import cv2
-import numpy as np
 from picamera2 import Picamera2
 
 from preprocess import find_bean_contours
 
-# --- Konfigurasi ---
+#Konfigurasi 
 DATASET_ROOT = "dataset"
-FRAME_SIZE = (640, 480)            # (width, height)
-CAPTURE_COOLDOWN_S = 0.4
+FRAME_SIZE = (640, 480)
+CAPTURE_COOLDOWN_S = 0.4   # jeda minimum antar capture otomatis
 PREVIEW_WINDOW = "Capture Preview"
-
-# ROI rectangle (x, y, w, h) untuk membatasi area aktif deteksi.
-# Set None untuk pakai seluruh frame. Isi koordinat saat hardware sudah final.
-ROI_RECT = None                    # TODO: contoh (180, 100, 280, 350)
-SHOW_DEBUG_MASK = True             # window mask threshold untuk kalibrasi
 
 
 def select_class():
+    """Tanya kelas target di awal sesi."""
     choice = input("Capture untuk kelas mana? [a]ccepted / [r]eject: ").strip().lower()
     if choice in ("a", "accepted"):
         return "accepted"
@@ -45,15 +48,8 @@ def select_class():
     sys.exit(1)
 
 
-def build_roi_mask(frame_hw, rect):
-    """frame_hw = (height, width). rect = (x, y, w, h) atau None."""
-    if rect is None:
-        return None
-    h, w = frame_hw
-    m = np.zeros((h, w), dtype=np.uint8)
-    x, y, rw, rh = rect
-    m[y:y + rh, x:x + rw] = 255
-    return m
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
 
 
 def make_filename(class_name, idx):
@@ -64,7 +60,7 @@ def make_filename(class_name, idx):
 def main():
     class_name = select_class()
     save_dir = os.path.join(DATASET_ROOT, class_name)
-    os.makedirs(save_dir, exist_ok=True)
+    ensure_dir(save_dir)
     print(f"[INFO] Menyimpan ke: {save_dir}")
 
     # Inisialisasi Picamera2
@@ -74,12 +70,9 @@ def main():
     )
     picam2.configure(config)
     picam2.start()
-    time.sleep(1.0)  # warm-up sensor
+    time.sleep(1.0)  
 
-    # Build ROI mask (FRAME_SIZE = (W, H), array shape = (H, W))
-    roi_mask = build_roi_mask((FRAME_SIZE[1], FRAME_SIZE[0]), ROI_RECT)
-
-    # Lanjutkan index dari file existing
+    # Hitung index awal berdasarkan file existing (lanjut, bukan overwrite)
     existing = [f for f in os.listdir(save_dir) if f.endswith((".jpg", ".png"))]
     counter = len(existing)
     print(f"[INFO] {counter} sampel sudah ada. Index lanjut dari sini.")
@@ -87,37 +80,28 @@ def main():
     prev_has_bean = False
     last_capture_t = 0.0
 
-    print("[INFO] Streaming. 'q' = keluar, SPASI = capture manual.")
+    print("[INFO] Mulai streaming. Tekan 'q' untuk keluar, SPASI untuk capture manual.")
 
     try:
         while True:
             frame_rgb = picam2.capture_array()
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
-            contours, mask = find_bean_contours(frame_bgr, roi_mask=roi_mask)
+            contours, mask = find_bean_contours(frame_bgr)
             has_bean = len(contours) > 0
             now = time.time()
 
-            # Visualisasi
+            # Visualisasi preview (kontur + info)
             preview = frame_bgr.copy()
             for c in contours:
                 x, y, w, h = cv2.boundingRect(c)
                 cv2.rectangle(preview, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-            # Gambar batas ROI sebagai panduan visual
-            if ROI_RECT is not None:
-                rx, ry, rw, rh = ROI_RECT
-                cv2.rectangle(preview, (rx, ry), (rx + rw, ry + rh),
-                              (255, 0, 0), 1)
-
-            info = (f"Kelas: {class_name} | Tersimpan: {counter} | "
-                    f"Biji terdeteksi: {len(contours)}")
+            info = f"Kelas: {class_name} | Tersimpan: {counter} | Biji terdeteksi: {len(contours)}"
             cv2.putText(preview, info, (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
             cv2.imshow(PREVIEW_WINDOW, preview)
-            if SHOW_DEBUG_MASK:
-                cv2.imshow("Mask (debug)", mask)
+            # cv2.imshow("Mask (debug)", mask)  #uncomment kalo mau debug threshold
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
