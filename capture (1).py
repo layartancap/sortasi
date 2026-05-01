@@ -90,10 +90,10 @@ def main():
     frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
             # Terapkan mask ke frame sebelum masuk ke fungsi
-            if roi_mask is not None:
-                frame_processed = cv2.bitwise_and(frame_bgr, frame_bgr, mask=roi_mask)
-            else:
-                frame_processed = frame_bgr
+    if roi_mask is not None:
+      frame_processed = cv2.bitwise_and(frame_bgr, frame_bgr, mask=roi_mask)
+    else:
+      frame_processed = frame_bgr
 
             # Hapus argumen roi_mask dari pemanggilan fungsi
             contours, mask = find_bean_contours(frame_processed)
